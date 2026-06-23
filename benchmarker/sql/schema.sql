@@ -7,8 +7,7 @@ CREATE TABLE users (
   `passhash` varchar(128) NOT NULL, -- SHA2 512 non-binary (hex)
   `authority` tinyint(1) NOT NULL DEFAULT 0,
   `del_flg` tinyint(1) NOT NULL DEFAULT 0,
-  `created_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  INDEX `idx_del_flg` (`del_flg`)
+  `created_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP
 ) DEFAULT CHARSET=utf8mb4;
 
 DROP TABLE IF EXISTS posts;
@@ -18,9 +17,7 @@ CREATE TABLE posts (
   `mime` varchar(64) NOT NULL,
   `imgdata` mediumblob NOT NULL,
   `body` text NOT NULL,
-  `created_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  INDEX `idx_created_at` (`created_at`),
-  INDEX `idx_user_id_created_at` (`user_id`, `created_at`)
+  `created_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP
 ) DEFAULT CHARSET=utf8mb4;
 
 DROP TABLE IF EXISTS comments;
@@ -29,7 +26,5 @@ CREATE TABLE comments (
   `post_id` int NOT NULL,
   `user_id` int NOT NULL,
   `comment` text NOT NULL,
-  `created_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  INDEX `idx_post_id` (`post_id`),
-  INDEX `idx_user_id` (`user_id`)
+  `created_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP
 ) DEFAULT CHARSET=utf8mb4;

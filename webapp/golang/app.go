@@ -3,8 +3,6 @@ package main
 import (
 	"context"
 	crand "crypto/rand"
-	"crypto/sha512"
-	"encoding/json"
 	"fmt"
 	"html/template"
 	"io"
@@ -12,8 +10,8 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path"
-	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -36,21 +34,15 @@ const (
 	postsPerPage  = 20
 	ISO8601Format = "2006-01-02T15:04:05-07:00"
 	UploadLimit   = 10 * 1024 * 1024 // 10mb
-	imageDir      = "../public/image"
-)
-
-var (
-	validAccountName = regexp.MustCompile(`\A[0-9a-zA-Z_]{3,}\z`)
-	validPassword    = regexp.MustCompile(`\A[0-9a-zA-Z_]{6,}\z`)
 )
 
 type User struct {
-	ID          int       `db:"id" json:"id"`
-	AccountName string    `db:"account_name" json:"account_name"`
-	Passhash    string    `db:"passhash" json:"passhash"`
-	Authority   int       `db:"authority" json:"authority"`
-	DelFlg      int       `db:"del_flg" json:"del_flg"`
-	CreatedAt   time.Time `db:"created_at" json:"created_at"`
+	ID          int       `db:"id"`
+	AccountName string    `db:"account_name"`
+	Passhash    string    `db:"passhash"`
+	Authority   int       `db:"authority"`
+	DelFlg      int       `db:"del_flg"`
+	CreatedAt   time.Time `db:"created_at"`
 }
 
 type Post struct {
@@ -99,42 +91,6 @@ func dbInitialize(ctx context.Context) {
 	for _, sql := range sqls {
 		db.ExecContext(ctx, sql)
 	}
-
-	// Add indexes (ignore errors for already-existing indexes)
-	indexSQLs := []string{
-		"ALTER TABLE posts ADD INDEX idx_created_at (created_at)",
-		"ALTER TABLE posts ADD INDEX idx_user_id_created_at (user_id, created_at)",
-		"ALTER TABLE comments ADD INDEX idx_post_id (post_id)",
-		"ALTER TABLE comments ADD INDEX idx_user_id (user_id)",
-		"ALTER TABLE users ADD INDEX idx_del_flg (del_flg)",
-	}
-	for _, sql := range indexSQLs {
-		db.ExecContext(ctx, sql)
-	}
-
-}
-
-func mimeToExt(mime string) string {
-	switch mime {
-	case "image/jpeg":
-		return ".jpg"
-	case "image/png":
-		return ".png"
-	case "image/gif":
-		return ".gif"
-	}
-	return ""
-}
-
-func saveImageToFilesystem(id int, mime string, data []byte) {
-	ext := mimeToExt(mime)
-	if ext == "" {
-		return
-	}
-	filePath := filepath.Join(imageDir, strconv.Itoa(id)+ext)
-	if err := os.WriteFile(filePath, data, 0644); err != nil {
-		log.Print(err)
-	}
 }
 
 func tryLogin(ctx context.Context, accountName, password string) *User {
@@ -146,17 +102,32 @@ func tryLogin(ctx context.Context, accountName, password string) *User {
 
 	if calculatePasshash(ctx, u.AccountName, password) == u.Passhash {
 		return &u
+	} else {
+		return nil
 	}
-	return nil
 }
 
 func validateUser(accountName, password string) bool {
-	return validAccountName.MatchString(accountName) && validPassword.MatchString(password)
+	return regexp.MustCompile(`\A[0-9a-zA-Z_]{3,}\z`).MatchString(accountName) &&
+		regexp.MustCompile(`\A[0-9a-zA-Z_]{6,}\z`).MatchString(password)
 }
 
-func digest(_ context.Context, src string) string {
-	h := sha512.Sum512([]byte(src))
-	return fmt.Sprintf("%x", h)
+// 今回のGo実装では言語側のエスケープの仕組みが使えないのでOSコマンドインジェクション対策できない
+// 取り急ぎPHPのescapeshellarg関数を参考に自前で実装
+// cf: http://jp2.php.net/manual/ja/function.escapeshellarg.php
+func escapeshellarg(arg string) string {
+	return "'" + strings.Replace(arg, "'", "'\\''", -1) + "'"
+}
+
+func digest(ctx context.Context, src string) string {
+	// opensslのバージョンによっては (stdin)= というのがつくので取る
+	out, err := exec.CommandContext(ctx, "/bin/bash", "-c", `printf "%s" `+escapeshellarg(src)+` | openssl dgst -sha512 | sed 's/^.*= //'`).Output()
+	if err != nil {
+		log.Print(err)
+		return ""
+	}
+
+	return strings.TrimSuffix(string(out), "\n")
 }
 
 func calculateSalt(ctx context.Context, accountName string) string {
@@ -169,6 +140,7 @@ func calculatePasshash(ctx context.Context, accountName, password string) string
 
 func getSession(r *http.Request) *sessions.Session {
 	session, _ := store.Get(r, "isuconp-go.session")
+
 	return session
 }
 
@@ -180,25 +152,11 @@ func getSessionUser(r *http.Request) User {
 		return User{}
 	}
 
-	cacheKey := fmt.Sprintf("user_%v", uid)
-	if item, err := memcacheClient.Get(cacheKey); err == nil {
-		var u User
-		if err := json.Unmarshal(item.Value, &u); err == nil {
-			return u
-		}
-	}
-
 	u := User{}
-	if err := db.GetContext(ctx, &u, "SELECT * FROM `users` WHERE `id` = ?", uid); err != nil {
-		return User{}
-	}
 
-	if data, err := json.Marshal(u); err == nil {
-		memcacheClient.Set(&memcache.Item{
-			Key:        cacheKey,
-			Value:      data,
-			Expiration: 30,
-		})
+	err := db.GetContext(ctx, &u, "SELECT * FROM `users` WHERE `id` = ?", uid)
+	if err != nil {
+		return User{}
 	}
 
 	return u
@@ -210,121 +168,51 @@ func getFlash(w http.ResponseWriter, r *http.Request, key string) string {
 
 	if !ok || value == nil {
 		return ""
+	} else {
+		delete(session.Values, key)
+		session.Save(r, w)
+		return value.(string)
 	}
-	delete(session.Values, key)
-	session.Save(r, w)
-	return value.(string)
 }
 
 func makePosts(ctx context.Context, results []Post, csrfToken string, allComments bool) ([]Post, error) {
-	if len(results) == 0 {
-		return nil, nil
-	}
-
-	postIDs := make([]int, len(results))
-	for i, p := range results {
-		postIDs[i] = p.ID
-	}
-
-	// Batch fetch comment counts per post
-	type countRow struct {
-		PostID int `db:"post_id"`
-		Count  int `db:"cnt"`
-	}
-	cntQuery, cntArgs, err := sqlx.In(
-		"SELECT `post_id`, COUNT(*) AS `cnt` FROM `comments` WHERE `post_id` IN (?) GROUP BY `post_id`",
-		postIDs,
-	)
-	if err != nil {
-		return nil, err
-	}
-	var cntRows []countRow
-	if err := db.SelectContext(ctx, &cntRows, db.Rebind(cntQuery), cntArgs...); err != nil {
-		return nil, err
-	}
-	commentCountByPostID := make(map[int]int, len(cntRows))
-	for _, c := range cntRows {
-		commentCountByPostID[c.PostID] = c.Count
-	}
-
-	// Batch fetch comments: top 3 per post or all (for single post detail)
-	var allCommentsList []Comment
-	if allComments {
-		q, args, err := sqlx.In(
-			"SELECT * FROM `comments` WHERE `post_id` IN (?) ORDER BY `created_at` DESC",
-			postIDs,
-		)
-		if err != nil {
-			return nil, err
-		}
-		if err := db.SelectContext(ctx, &allCommentsList, db.Rebind(q), args...); err != nil {
-			return nil, err
-		}
-	} else {
-		q, args, err := sqlx.In(
-			"SELECT `id`, `post_id`, `user_id`, `comment`, `created_at` FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY `post_id` ORDER BY `created_at` DESC) AS rn FROM `comments` WHERE `post_id` IN (?)) t WHERE rn <= 3",
-			postIDs,
-		)
-		if err != nil {
-			return nil, err
-		}
-		if err := db.SelectContext(ctx, &allCommentsList, db.Rebind(q), args...); err != nil {
-			return nil, err
-		}
-	}
-
-	// Group comments by post_id (already DESC from DB)
-	commentsByPostID := make(map[int][]Comment)
-	for _, c := range allCommentsList {
-		commentsByPostID[c.PostID] = append(commentsByPostID[c.PostID], c)
-	}
-
-	// Collect all user IDs needed (post authors + comment authors)
-	userIDSet := make(map[int]struct{})
-	for _, p := range results {
-		userIDSet[p.UserID] = struct{}{}
-	}
-	for _, comments := range commentsByPostID {
-		for _, c := range comments {
-			userIDSet[c.UserID] = struct{}{}
-		}
-	}
-	userIDs := make([]int, 0, len(userIDSet))
-	for uid := range userIDSet {
-		userIDs = append(userIDs, uid)
-	}
-
-	// Batch fetch all needed users in one query
-	usersByID := make(map[int]User)
-	if len(userIDs) > 0 {
-		userQuery, userArgs, err := sqlx.In("SELECT * FROM `users` WHERE `id` IN (?)", userIDs)
-		if err != nil {
-			return nil, err
-		}
-		var users []User
-		if err := db.SelectContext(ctx, &users, db.Rebind(userQuery), userArgs...); err != nil {
-			return nil, err
-		}
-		for _, u := range users {
-			usersByID[u.ID] = u
-		}
-	}
-
 	var posts []Post
-	for _, p := range results {
-		p.CommentCount = commentCountByPostID[p.ID]
 
-		comments := make([]Comment, len(commentsByPostID[p.ID]))
-		copy(comments, commentsByPostID[p.ID])
-		// reverse: DB returned DESC, templates expect ASC
+	for _, p := range results {
+		err := db.GetContext(ctx, &p.CommentCount, "SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?", p.ID)
+		if err != nil {
+			return nil, err
+		}
+
+		query := "SELECT * FROM `comments` WHERE `post_id` = ? ORDER BY `created_at` DESC"
+		if !allComments {
+			query += " LIMIT 3"
+		}
+		var comments []Comment
+		err = db.SelectContext(ctx, &comments, query, p.ID)
+		if err != nil {
+			return nil, err
+		}
+
+		for i := range comments {
+			err := db.GetContext(ctx, &comments[i].User, "SELECT * FROM `users` WHERE `id` = ?", comments[i].UserID)
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		// reverse
 		for i, j := 0, len(comments)-1; i < j; i, j = i+1, j-1 {
 			comments[i], comments[j] = comments[j], comments[i]
 		}
-		for i := range comments {
-			comments[i].User = usersByID[comments[i].UserID]
-		}
+
 		p.Comments = comments
-		p.User = usersByID[p.UserID]
+
+		err = db.GetContext(ctx, &p.User, "SELECT * FROM `users` WHERE `id` = ?", p.UserID)
+		if err != nil {
+			return nil, err
+		}
+
 		p.CSRFToken = csrfToken
 
 		if p.User.DelFlg == 0 {
@@ -459,6 +347,7 @@ func postRegister(w http.ResponseWriter, r *http.Request) {
 	}
 
 	exists := 0
+	// ユーザーが存在しない場合はエラーになるのでエラーチェックはしない
 	db.GetContext(ctx, &exists, "SELECT 1 FROM users WHERE `account_name` = ?", accountName)
 
 	if exists == 1 {
@@ -504,9 +393,8 @@ func getIndex(w http.ResponseWriter, r *http.Request) {
 	me := getSessionUser(r)
 
 	results := []Post{}
-	err := db.SelectContext(ctx, &results,
-		"SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` ORDER BY `created_at` DESC LIMIT ?",
-		postsPerPage*3)
+
+	err := db.SelectContext(ctx, &results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` ORDER BY `created_at` DESC")
 	if err != nil {
 		log.Print(err)
 		return
@@ -551,19 +439,9 @@ func getAccountName(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Fetch all post IDs for count and commentedCount
-	var allPostIDs []int
-	if err = db.SelectContext(ctx, &allPostIDs, "SELECT `id` FROM `posts` WHERE `user_id` = ?", user.ID); err != nil {
-		log.Print(err)
-		return
-	}
-	postCount := len(allPostIDs)
-
-	// Fetch limited posts for display
 	results := []Post{}
-	err = db.SelectContext(ctx, &results,
-		"SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `user_id` = ? ORDER BY `created_at` DESC LIMIT ?",
-		user.ID, postsPerPage)
+
+	err = db.SelectContext(ctx, &results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `user_id` = ? ORDER BY `created_at` DESC", user.ID)
 	if err != nil {
 		log.Print(err)
 		return
@@ -576,19 +454,36 @@ func getAccountName(w http.ResponseWriter, r *http.Request) {
 	}
 
 	commentCount := 0
-	if err = db.GetContext(ctx, &commentCount, "SELECT COUNT(*) AS count FROM `comments` WHERE `user_id` = ?", user.ID); err != nil {
+	err = db.GetContext(ctx, &commentCount, "SELECT COUNT(*) AS count FROM `comments` WHERE `user_id` = ?", user.ID)
+	if err != nil {
 		log.Print(err)
 		return
 	}
 
+	postIDs := []int{}
+	err = db.SelectContext(ctx, &postIDs, "SELECT `id` FROM `posts` WHERE `user_id` = ?", user.ID)
+	if err != nil {
+		log.Print(err)
+		return
+	}
+	postCount := len(postIDs)
+
 	commentedCount := 0
 	if postCount > 0 {
-		q, args, err := sqlx.In("SELECT COUNT(*) AS count FROM `comments` WHERE `post_id` IN (?)", allPostIDs)
-		if err != nil {
-			log.Print(err)
-			return
+		s := []string{}
+		for range postIDs {
+			s = append(s, "?")
 		}
-		if err = db.GetContext(ctx, &commentedCount, db.Rebind(q), args...); err != nil {
+		placeholder := strings.Join(s, ", ")
+
+		// convert []int -> []any
+		args := make([]any, len(postIDs))
+		for i, v := range postIDs {
+			args[i] = v
+		}
+
+		err = db.GetContext(ctx, &commentedCount, "SELECT COUNT(*) AS count FROM `comments` WHERE `post_id` IN ("+placeholder+")", args...)
+		if err != nil {
 			log.Print(err)
 			return
 		}
@@ -635,9 +530,7 @@ func getPosts(w http.ResponseWriter, r *http.Request) {
 	}
 
 	results := []Post{}
-	err = db.SelectContext(ctx, &results,
-		"SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `created_at` <= ? ORDER BY `created_at` DESC LIMIT ?",
-		t.Format(ISO8601Format), postsPerPage*3)
+	err = db.SelectContext(ctx, &results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `created_at` <= ? ORDER BY `created_at` DESC", t.Format(ISO8601Format))
 	if err != nil {
 		log.Print(err)
 		return
@@ -674,7 +567,7 @@ func getPostsID(w http.ResponseWriter, r *http.Request) {
 	}
 
 	results := []Post{}
-	err = db.SelectContext(ctx, &results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `id` = ?", pid)
+	err = db.SelectContext(ctx, &results, "SELECT * FROM `posts` WHERE `id` = ?", pid)
 	if err != nil {
 		log.Print(err)
 		return
@@ -734,6 +627,7 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 
 	mime := ""
 	if file != nil {
+		// 投稿のContent-Typeからファイルのタイプを決定する
 		contentType := header.Header["Content-Type"][0]
 		if strings.Contains(contentType, "jpeg") {
 			mime = "image/jpeg"
@@ -786,8 +680,6 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	go saveImageToFilesystem(int(pid), mime, filedata)
-
 	http.Redirect(w, r, "/posts/"+strconv.FormatInt(pid, 10), http.StatusFound)
 }
 
@@ -800,14 +692,14 @@ func getImage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ext := r.PathValue("ext")
-
 	post := Post{}
-	err = db.GetContext(ctx, &post, "SELECT `id`, `mime`, `imgdata` FROM `posts` WHERE `id` = ?", pid)
+	err = db.GetContext(ctx, &post, "SELECT * FROM `posts` WHERE `id` = ?", pid)
 	if err != nil {
 		log.Print(err)
 		return
 	}
+
+	ext := r.PathValue("ext")
 
 	if ext == "jpg" && post.Mime == "image/jpeg" ||
 		ext == "png" && post.Mime == "image/png" ||
@@ -818,7 +710,6 @@ func getImage(w http.ResponseWriter, r *http.Request) {
 			log.Print(err)
 			return
 		}
-		go saveImageToFilesystem(pid, post.Mime, post.Imgdata)
 		return
 	}
 
@@ -912,7 +803,6 @@ func postAdminBanned(w http.ResponseWriter, r *http.Request) {
 
 	for _, id := range r.Form["uid[]"] {
 		db.ExecContext(ctx, query, 1, id)
-		memcacheClient.Delete(fmt.Sprintf("user_%s", id))
 	}
 
 	http.Redirect(w, r, "/admin/banned", http.StatusFound)
@@ -959,10 +849,6 @@ func main() {
 		log.Fatalf("Failed to connect to DB: %s.", err.Error())
 	}
 	defer db.Close()
-
-	if err := os.MkdirAll(imageDir, 0755); err != nil {
-		log.Printf("Warning: could not create image directory: %v", err)
-	}
 
 	r := chi.NewRouter()
 
