@@ -4,6 +4,7 @@ import (
 	"context"
 	crand "crypto/rand"
 	"crypto/sha512"
+	"encoding/json"
 	"fmt"
 	"html/template"
 	"io"
@@ -28,6 +29,9 @@ import (
 var (
 	db    *sqlx.DB
 	store *gsm.MemcacheStore
+
+	validAccountName = regexp.MustCompile(`\A[0-9a-zA-Z_]{3,}\z`)
+	validPassword    = regexp.MustCompile(`\A[0-9a-zA-Z_]{6,}\z`)
 )
 
 const (
@@ -37,12 +41,12 @@ const (
 )
 
 type User struct {
-	ID          int       `db:"id"`
-	AccountName string    `db:"account_name"`
-	Passhash    string    `db:"passhash"`
-	Authority   int       `db:"authority"`
-	DelFlg      int       `db:"del_flg"`
-	CreatedAt   time.Time `db:"created_at"`
+	ID          int       `db:"id" json:"id"`
+	AccountName string    `db:"account_name" json:"account_name"`
+	Passhash    string    `db:"passhash" json:"passhash"`
+	Authority   int       `db:"authority" json:"authority"`
+	DelFlg      int       `db:"del_flg" json:"del_flg"`
+	CreatedAt   time.Time `db:"created_at" json:"created_at"`
 }
 
 type Post struct {
@@ -108,8 +112,7 @@ func tryLogin(ctx context.Context, accountName, password string) *User {
 }
 
 func validateUser(accountName, password string) bool {
-	return regexp.MustCompile(`\A[0-9a-zA-Z_]{3,}\z`).MatchString(accountName) &&
-		regexp.MustCompile(`\A[0-9a-zA-Z_]{6,}\z`).MatchString(password)
+	return validAccountName.MatchString(accountName) && validPassword.MatchString(password)
 }
 
 func digest(_ context.Context, src string) string {
@@ -139,11 +142,25 @@ func getSessionUser(r *http.Request) User {
 		return User{}
 	}
 
-	u := User{}
+	cacheKey := fmt.Sprintf("user_%v", uid)
+	if item, err := memcacheClient.Get(cacheKey); err == nil {
+		var u User
+		if err := json.Unmarshal(item.Value, &u); err == nil {
+			return u
+		}
+	}
 
-	err := db.GetContext(ctx, &u, "SELECT * FROM `users` WHERE `id` = ?", uid)
-	if err != nil {
+	u := User{}
+	if err := db.GetContext(ctx, &u, "SELECT * FROM `users` WHERE `id` = ?", uid); err != nil {
 		return User{}
+	}
+
+	if data, err := json.Marshal(u); err == nil {
+		memcacheClient.Set(&memcache.Item{
+			Key:        cacheKey,
+			Value:      data,
+			Expiration: 30,
+		})
 	}
 
 	return u
@@ -849,6 +866,7 @@ func postAdminBanned(w http.ResponseWriter, r *http.Request) {
 
 	for _, id := range r.Form["uid[]"] {
 		db.ExecContext(ctx, query, 1, id)
+		memcacheClient.Delete(fmt.Sprintf("user_%s", id))
 	}
 
 	http.Redirect(w, r, "/admin/banned", http.StatusFound)
