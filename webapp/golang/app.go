@@ -176,43 +176,114 @@ func getFlash(w http.ResponseWriter, r *http.Request, key string) string {
 }
 
 func makePosts(ctx context.Context, results []Post, csrfToken string, allComments bool) ([]Post, error) {
-	var posts []Post
+	if len(results) == 0 {
+		return nil, nil
+	}
 
+	postIDs := make([]int, len(results))
+	for i, p := range results {
+		postIDs[i] = p.ID
+	}
+
+	// コメント件数を一括取得
+	type countRow struct {
+		PostID int `db:"post_id"`
+		Count  int `db:"cnt"`
+	}
+	cntQuery, cntArgs, err := sqlx.In(
+		"SELECT `post_id`, COUNT(*) AS `cnt` FROM `comments` WHERE `post_id` IN (?) GROUP BY `post_id`",
+		postIDs,
+	)
+	if err != nil {
+		return nil, err
+	}
+	var cntRows []countRow
+	if err := db.SelectContext(ctx, &cntRows, db.Rebind(cntQuery), cntArgs...); err != nil {
+		return nil, err
+	}
+	commentCountByPostID := make(map[int]int, len(cntRows))
+	for _, c := range cntRows {
+		commentCountByPostID[c.PostID] = c.Count
+	}
+
+	// コメントを一括取得（詳細ページは全件、一覧は投稿ごと上位3件）
+	var allCommentsList []Comment
+	if allComments {
+		q, args, err := sqlx.In(
+			"SELECT * FROM `comments` WHERE `post_id` IN (?) ORDER BY `created_at` DESC",
+			postIDs,
+		)
+		if err != nil {
+			return nil, err
+		}
+		if err := db.SelectContext(ctx, &allCommentsList, db.Rebind(q), args...); err != nil {
+			return nil, err
+		}
+	} else {
+		q, args, err := sqlx.In(
+			"SELECT `id`, `post_id`, `user_id`, `comment`, `created_at` FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY `post_id` ORDER BY `created_at` DESC) AS rn FROM `comments` WHERE `post_id` IN (?)) t WHERE rn <= 3",
+			postIDs,
+		)
+		if err != nil {
+			return nil, err
+		}
+		if err := db.SelectContext(ctx, &allCommentsList, db.Rebind(q), args...); err != nil {
+			return nil, err
+		}
+	}
+
+	// post_id でグループ化（DBはDESC順で返す）
+	commentsByPostID := make(map[int][]Comment)
+	for _, c := range allCommentsList {
+		commentsByPostID[c.PostID] = append(commentsByPostID[c.PostID], c)
+	}
+
+	// 投稿者とコメント投稿者のユーザーIDを収集
+	userIDSet := make(map[int]struct{})
 	for _, p := range results {
-		err := db.GetContext(ctx, &p.CommentCount, "SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?", p.ID)
+		userIDSet[p.UserID] = struct{}{}
+	}
+	for _, comments := range commentsByPostID {
+		for _, c := range comments {
+			userIDSet[c.UserID] = struct{}{}
+		}
+	}
+	userIDs := make([]int, 0, len(userIDSet))
+	for uid := range userIDSet {
+		userIDs = append(userIDs, uid)
+	}
+
+	// ユーザーを一括取得
+	usersByID := make(map[int]User)
+	if len(userIDs) > 0 {
+		userQuery, userArgs, err := sqlx.In("SELECT * FROM `users` WHERE `id` IN (?)", userIDs)
 		if err != nil {
 			return nil, err
 		}
-
-		query := "SELECT * FROM `comments` WHERE `post_id` = ? ORDER BY `created_at` DESC"
-		if !allComments {
-			query += " LIMIT 3"
-		}
-		var comments []Comment
-		err = db.SelectContext(ctx, &comments, query, p.ID)
-		if err != nil {
+		var users []User
+		if err := db.SelectContext(ctx, &users, db.Rebind(userQuery), userArgs...); err != nil {
 			return nil, err
 		}
-
-		for i := range comments {
-			err := db.GetContext(ctx, &comments[i].User, "SELECT * FROM `users` WHERE `id` = ?", comments[i].UserID)
-			if err != nil {
-				return nil, err
-			}
+		for _, u := range users {
+			usersByID[u.ID] = u
 		}
+	}
 
-		// reverse
+	var posts []Post
+	for _, p := range results {
+		p.CommentCount = commentCountByPostID[p.ID]
+
+		comments := make([]Comment, len(commentsByPostID[p.ID]))
+		copy(comments, commentsByPostID[p.ID])
+		// DBはDESC順、テンプレートはASC順が期待値なので反転
 		for i, j := 0, len(comments)-1; i < j; i, j = i+1, j-1 {
 			comments[i], comments[j] = comments[j], comments[i]
 		}
-
-		p.Comments = comments
-
-		err = db.GetContext(ctx, &p.User, "SELECT * FROM `users` WHERE `id` = ?", p.UserID)
-		if err != nil {
-			return nil, err
+		for i := range comments {
+			comments[i].User = usersByID[comments[i].UserID]
 		}
-
+		p.Comments = comments
+		p.User = usersByID[p.UserID]
 		p.CSRFToken = csrfToken
 
 		if p.User.DelFlg == 0 {
