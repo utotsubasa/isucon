@@ -87,8 +87,19 @@ func dbInitialize(ctx context.Context) {
 		"UPDATE users SET del_flg = 0",
 		"UPDATE users SET del_flg = 1 WHERE id % 50 = 0",
 	}
-
 	for _, sql := range sqls {
+		db.ExecContext(ctx, sql)
+	}
+
+	// インデックスが存在しない場合のみ追加（エラーは無視）
+	indexes := []string{
+		"ALTER TABLE posts ADD INDEX idx_created_at (created_at)",
+		"ALTER TABLE posts ADD INDEX idx_user_id_created_at (user_id, created_at)",
+		"ALTER TABLE comments ADD INDEX idx_post_id (post_id)",
+		"ALTER TABLE comments ADD INDEX idx_user_id (user_id)",
+		"ALTER TABLE users ADD INDEX idx_del_flg (del_flg)",
+	}
+	for _, sql := range indexes {
 		db.ExecContext(ctx, sql)
 	}
 }
