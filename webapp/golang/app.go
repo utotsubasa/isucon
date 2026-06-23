@@ -112,8 +112,6 @@ func dbInitialize(ctx context.Context) {
 		db.ExecContext(ctx, sql)
 	}
 
-	os.MkdirAll(imageDir, 0755)
-	go writeAllImagesToFilesystem(context.Background())
 }
 
 func mimeToExt(mime string) string {
@@ -136,31 +134,6 @@ func saveImageToFilesystem(id int, mime string, data []byte) {
 	filePath := filepath.Join(imageDir, strconv.Itoa(id)+ext)
 	if err := os.WriteFile(filePath, data, 0644); err != nil {
 		log.Print(err)
-	}
-}
-
-func writeAllImagesToFilesystem(ctx context.Context) {
-	type ImageRow struct {
-		ID      int    `db:"id"`
-		Mime    string `db:"mime"`
-		Imgdata []byte `db:"imgdata"`
-	}
-
-	offset := 0
-	const batchSize = 100
-	for {
-		var rows []ImageRow
-		if err := db.SelectContext(ctx, &rows, "SELECT `id`, `mime`, `imgdata` FROM `posts` LIMIT ? OFFSET ?", batchSize, offset); err != nil {
-			log.Print(err)
-			return
-		}
-		if len(rows) == 0 {
-			break
-		}
-		for _, row := range rows {
-			saveImageToFilesystem(row.ID, row.Mime, row.Imgdata)
-		}
-		offset += len(rows)
 	}
 }
 
@@ -253,27 +226,57 @@ func makePosts(ctx context.Context, results []Post, csrfToken string, allComment
 		postIDs[i] = p.ID
 	}
 
-	// Batch fetch all comments for these posts in one query
-	commentQuery, commentArgs, err := sqlx.In(
-		"SELECT * FROM `comments` WHERE `post_id` IN (?) ORDER BY `created_at` DESC",
+	// Batch fetch comment counts per post
+	type countRow struct {
+		PostID int `db:"post_id"`
+		Count  int `db:"cnt"`
+	}
+	cntQuery, cntArgs, err := sqlx.In(
+		"SELECT `post_id`, COUNT(*) AS `cnt` FROM `comments` WHERE `post_id` IN (?) GROUP BY `post_id`",
 		postIDs,
 	)
 	if err != nil {
 		return nil, err
 	}
-	var allCommentsList []Comment
-	if err := db.SelectContext(ctx, &allCommentsList, db.Rebind(commentQuery), commentArgs...); err != nil {
+	var cntRows []countRow
+	if err := db.SelectContext(ctx, &cntRows, db.Rebind(cntQuery), cntArgs...); err != nil {
 		return nil, err
 	}
+	commentCountByPostID := make(map[int]int, len(cntRows))
+	for _, c := range cntRows {
+		commentCountByPostID[c.PostID] = c.Count
+	}
 
-	// Group comments by post_id (already DESC from DB, take first 3 per post if !allComments)
-	commentsByPostID := make(map[int][]Comment)
-	commentCountByPostID := make(map[int]int)
-	for _, c := range allCommentsList {
-		commentCountByPostID[c.PostID]++
-		if allComments || len(commentsByPostID[c.PostID]) < 3 {
-			commentsByPostID[c.PostID] = append(commentsByPostID[c.PostID], c)
+	// Batch fetch comments: top 3 per post or all (for single post detail)
+	var allCommentsList []Comment
+	if allComments {
+		q, args, err := sqlx.In(
+			"SELECT * FROM `comments` WHERE `post_id` IN (?) ORDER BY `created_at` DESC",
+			postIDs,
+		)
+		if err != nil {
+			return nil, err
 		}
+		if err := db.SelectContext(ctx, &allCommentsList, db.Rebind(q), args...); err != nil {
+			return nil, err
+		}
+	} else {
+		q, args, err := sqlx.In(
+			"SELECT `id`, `post_id`, `user_id`, `comment`, `created_at` FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY `post_id` ORDER BY `created_at` DESC) AS rn FROM `comments` WHERE `post_id` IN (?)) t WHERE rn <= 3",
+			postIDs,
+		)
+		if err != nil {
+			return nil, err
+		}
+		if err := db.SelectContext(ctx, &allCommentsList, db.Rebind(q), args...); err != nil {
+			return nil, err
+		}
+	}
+
+	// Group comments by post_id (already DESC from DB)
+	commentsByPostID := make(map[int][]Comment)
+	for _, c := range allCommentsList {
+		commentsByPostID[c.PostID] = append(commentsByPostID[c.PostID], c)
 	}
 
 	// Collect all user IDs needed (post authors + comment authors)
