@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	crand "crypto/rand"
-	"crypto/sha512"
 	"fmt"
 	"html/template"
 	"io"
@@ -11,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path"
 	"regexp"
 	"strconv"
@@ -87,19 +87,8 @@ func dbInitialize(ctx context.Context) {
 		"UPDATE users SET del_flg = 0",
 		"UPDATE users SET del_flg = 1 WHERE id % 50 = 0",
 	}
-	for _, sql := range sqls {
-		db.ExecContext(ctx, sql)
-	}
 
-	// インデックスが存在しない場合のみ追加（エラーは無視）
-	indexes := []string{
-		"ALTER TABLE posts ADD INDEX idx_created_at (created_at)",
-		"ALTER TABLE posts ADD INDEX idx_user_id_created_at (user_id, created_at)",
-		"ALTER TABLE comments ADD INDEX idx_post_id (post_id)",
-		"ALTER TABLE comments ADD INDEX idx_user_id (user_id)",
-		"ALTER TABLE users ADD INDEX idx_del_flg (del_flg)",
-	}
-	for _, sql := range indexes {
+	for _, sql := range sqls {
 		db.ExecContext(ctx, sql)
 	}
 }
@@ -123,9 +112,22 @@ func validateUser(accountName, password string) bool {
 		regexp.MustCompile(`\A[0-9a-zA-Z_]{6,}\z`).MatchString(password)
 }
 
-func digest(_ context.Context, src string) string {
-	h := sha512.Sum512([]byte(src))
-	return fmt.Sprintf("%x", h)
+// 今回のGo実装では言語側のエスケープの仕組みが使えないのでOSコマンドインジェクション対策できない
+// 取り急ぎPHPのescapeshellarg関数を参考に自前で実装
+// cf: http://jp2.php.net/manual/ja/function.escapeshellarg.php
+func escapeshellarg(arg string) string {
+	return "'" + strings.Replace(arg, "'", "'\\''", -1) + "'"
+}
+
+func digest(ctx context.Context, src string) string {
+	// opensslのバージョンによっては (stdin)= というのがつくので取る
+	out, err := exec.CommandContext(ctx, "/bin/bash", "-c", `printf "%s" `+escapeshellarg(src)+` | openssl dgst -sha512 | sed 's/^.*= //'`).Output()
+	if err != nil {
+		log.Print(err)
+		return ""
+	}
+
+	return strings.TrimSuffix(string(out), "\n")
 }
 
 func calculateSalt(ctx context.Context, accountName string) string {
@@ -173,131 +175,44 @@ func getFlash(w http.ResponseWriter, r *http.Request, key string) string {
 	}
 }
 
-// commentJoinRow はコメント・ユーザー・件数をJOINで一括取得するためのスキャン用型
-type commentJoinRow struct {
-	ID           int       `db:"id"`
-	PostID       int       `db:"post_id"`
-	UserID       int       `db:"user_id"`
-	Comment      string    `db:"comment"`
-	CreatedAt    time.Time `db:"created_at"`
-	TotalCount   int       `db:"total_count"`
-	UID          int       `db:"u_id"`
-	UAccountName string    `db:"u_account_name"`
-	UPasshash    string    `db:"u_passhash"`
-	UAuthority   int       `db:"u_authority"`
-	UDelFlg      int       `db:"u_del_flg"`
-	UCreatedAt   time.Time `db:"u_created_at"`
-}
-
 func makePosts(ctx context.Context, results []Post, csrfToken string, allComments bool) ([]Post, error) {
-	if len(results) == 0 {
-		return nil, nil
-	}
-
-	postIDs := make([]int, len(results))
-	for i, p := range results {
-		postIDs[i] = p.ID
-	}
-
-	// コメント・コメントユーザー・件数を1クエリで取得（JOIN + ウィンドウ関数）
-	var rows []commentJoinRow
-	if allComments {
-		q, args, err := sqlx.In(`
-			SELECT c.id, c.post_id, c.user_id, c.comment, c.created_at,
-			       COUNT(*) OVER (PARTITION BY c.post_id) AS total_count,
-			       u.id AS u_id, u.account_name AS u_account_name, u.passhash AS u_passhash,
-			       u.authority AS u_authority, u.del_flg AS u_del_flg, u.created_at AS u_created_at
-			FROM comments c
-			JOIN users u ON c.user_id = u.id
-			WHERE c.post_id IN (?)
-			ORDER BY c.created_at DESC`, postIDs)
-		if err != nil {
-			return nil, err
-		}
-		if err := db.SelectContext(ctx, &rows, db.Rebind(q), args...); err != nil {
-			return nil, err
-		}
-	} else {
-		q, args, err := sqlx.In(`
-			SELECT c.id, c.post_id, c.user_id, c.comment, c.created_at, c.total_count,
-			       u.id AS u_id, u.account_name AS u_account_name, u.passhash AS u_passhash,
-			       u.authority AS u_authority, u.del_flg AS u_del_flg, u.created_at AS u_created_at
-			FROM (
-			    SELECT *,
-			           ROW_NUMBER() OVER (PARTITION BY post_id ORDER BY created_at DESC) AS rn,
-			           COUNT(*) OVER (PARTITION BY post_id) AS total_count
-			    FROM comments WHERE post_id IN (?)
-			) c
-			JOIN users u ON c.user_id = u.id
-			WHERE c.rn <= 3
-			ORDER BY c.post_id, c.created_at DESC`, postIDs)
-		if err != nil {
-			return nil, err
-		}
-		if err := db.SelectContext(ctx, &rows, db.Rebind(q), args...); err != nil {
-			return nil, err
-		}
-	}
-
-	// post_id ごとにコメントと件数を整理
-	type commentData struct {
-		comments []Comment
-		count    int
-	}
-	commentDataByPostID := make(map[int]*commentData)
-	for _, row := range rows {
-		if _, ok := commentDataByPostID[row.PostID]; !ok {
-			commentDataByPostID[row.PostID] = &commentData{count: row.TotalCount}
-		}
-		commentDataByPostID[row.PostID].comments = append(commentDataByPostID[row.PostID].comments, Comment{
-			ID:        row.ID,
-			PostID:    row.PostID,
-			UserID:    row.UserID,
-			Comment:   row.Comment,
-			CreatedAt: row.CreatedAt,
-			User: User{
-				ID:          row.UID,
-				AccountName: row.UAccountName,
-				Passhash:    row.UPasshash,
-				Authority:   row.UAuthority,
-				DelFlg:      row.UDelFlg,
-				CreatedAt:   row.UCreatedAt,
-			},
-		})
-	}
-
-	// 投稿ユーザーを一括取得
-	usersByID := make(map[int]User)
-	postUserIDs := make([]int, len(results))
-	for i, p := range results {
-		postUserIDs[i] = p.UserID
-	}
-	userQuery, userArgs, err := sqlx.In("SELECT * FROM `users` WHERE `id` IN (?)", postUserIDs)
-	if err != nil {
-		return nil, err
-	}
-	var users []User
-	if err := db.SelectContext(ctx, &users, db.Rebind(userQuery), userArgs...); err != nil {
-		return nil, err
-	}
-	for _, u := range users {
-		usersByID[u.ID] = u
-	}
-
 	var posts []Post
+
 	for _, p := range results {
-		data := commentDataByPostID[p.ID]
-		if data != nil {
-			p.CommentCount = data.count
-			// DBはDESC順、テンプレートはASC順が期待値なので反転
-			comments := make([]Comment, len(data.comments))
-			copy(comments, data.comments)
-			for i, j := 0, len(comments)-1; i < j; i, j = i+1, j-1 {
-				comments[i], comments[j] = comments[j], comments[i]
-			}
-			p.Comments = comments
+		err := db.GetContext(ctx, &p.CommentCount, "SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?", p.ID)
+		if err != nil {
+			return nil, err
 		}
-		p.User = usersByID[p.UserID]
+
+		query := "SELECT * FROM `comments` WHERE `post_id` = ? ORDER BY `created_at` DESC"
+		if !allComments {
+			query += " LIMIT 3"
+		}
+		var comments []Comment
+		err = db.SelectContext(ctx, &comments, query, p.ID)
+		if err != nil {
+			return nil, err
+		}
+
+		for i := range comments {
+			err := db.GetContext(ctx, &comments[i].User, "SELECT * FROM `users` WHERE `id` = ?", comments[i].UserID)
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		// reverse
+		for i, j := 0, len(comments)-1; i < j; i, j = i+1, j-1 {
+			comments[i], comments[j] = comments[j], comments[i]
+		}
+
+		p.Comments = comments
+
+		err = db.GetContext(ctx, &p.User, "SELECT * FROM `users` WHERE `id` = ?", p.UserID)
+		if err != nil {
+			return nil, err
+		}
+
 		p.CSRFToken = csrfToken
 
 		if p.User.DelFlg == 0 {
@@ -479,7 +394,7 @@ func getIndex(w http.ResponseWriter, r *http.Request) {
 
 	results := []Post{}
 
-	err := db.SelectContext(ctx, &results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` ORDER BY `created_at` DESC LIMIT ?", postsPerPage*3)
+	err := db.SelectContext(ctx, &results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` ORDER BY `created_at` DESC")
 	if err != nil {
 		log.Print(err)
 		return
@@ -526,7 +441,7 @@ func getAccountName(w http.ResponseWriter, r *http.Request) {
 
 	results := []Post{}
 
-	err = db.SelectContext(ctx, &results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `user_id` = ? ORDER BY `created_at` DESC LIMIT ?", user.ID, postsPerPage)
+	err = db.SelectContext(ctx, &results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `user_id` = ? ORDER BY `created_at` DESC", user.ID)
 	if err != nil {
 		log.Print(err)
 		return
@@ -615,7 +530,7 @@ func getPosts(w http.ResponseWriter, r *http.Request) {
 	}
 
 	results := []Post{}
-	err = db.SelectContext(ctx, &results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `created_at` <= ? ORDER BY `created_at` DESC LIMIT ?", t.Format(ISO8601Format), postsPerPage*3)
+	err = db.SelectContext(ctx, &results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `created_at` <= ? ORDER BY `created_at` DESC", t.Format(ISO8601Format))
 	if err != nil {
 		log.Print(err)
 		return
