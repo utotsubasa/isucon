@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -38,6 +39,7 @@ const (
 	postsPerPage  = 20
 	ISO8601Format = "2006-01-02T15:04:05-07:00"
 	UploadLimit   = 10 * 1024 * 1024 // 10mb
+	imageDir      = "../public/image"
 )
 
 type User struct {
@@ -81,6 +83,23 @@ func init() {
 	memcacheClient = memcache.New(memdAddr)
 	store = gsm.NewMemcacheStore(memcacheClient, "iscogram_", []byte("sendagaya"))
 	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
+}
+
+func saveImageToFilesystem(id int, mime string, data []byte) {
+	var ext string
+	switch mime {
+	case "image/jpeg":
+		ext = ".jpg"
+	case "image/png":
+		ext = ".png"
+	case "image/gif":
+		ext = ".gif"
+	default:
+		return
+	}
+	if err := os.WriteFile(filepath.Join(imageDir, strconv.Itoa(id)+ext), data, 0644); err != nil {
+		log.Print(err)
+	}
 }
 
 func dbInitialize(ctx context.Context) {
@@ -743,6 +762,7 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	go saveImageToFilesystem(int(pid), mime, filedata)
 	http.Redirect(w, r, "/posts/"+strconv.FormatInt(pid, 10), http.StatusFound)
 }
 
@@ -756,7 +776,7 @@ func getImage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	post := Post{}
-	err = db.GetContext(ctx, &post, "SELECT * FROM `posts` WHERE `id` = ?", pid)
+	err = db.GetContext(ctx, &post, "SELECT `id`, `mime`, `imgdata` FROM `posts` WHERE `id` = ?", pid)
 	if err != nil {
 		log.Print(err)
 		return
@@ -773,6 +793,7 @@ func getImage(w http.ResponseWriter, r *http.Request) {
 			log.Print(err)
 			return
 		}
+		go saveImageToFilesystem(pid, post.Mime, post.Imgdata)
 		return
 	}
 
@@ -913,6 +934,10 @@ func main() {
 		log.Fatalf("Failed to connect to DB: %s.", err.Error())
 	}
 	defer db.Close()
+
+	if err := os.MkdirAll(imageDir, 0755); err != nil {
+		log.Fatalf("Failed to create image directory: %s.", err.Error())
+	}
 
 	r := chi.NewRouter()
 
