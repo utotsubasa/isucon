@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	_ "net/http/pprof"
+
 	crand "crypto/rand"
 	"crypto/sha512"
 	"encoding/json"
@@ -20,8 +22,10 @@ import (
 	"time"
 
 	"github.com/bradfitz/gomemcache/memcache"
+
 	gsm "github.com/bradleypeabody/gorilla-sessions-memcache"
 	"github.com/go-chi/chi/v5"
+
 	mysql "github.com/go-sql-driver/mysql"
 	"github.com/gorilla/sessions"
 	"github.com/jmoiron/sqlx"
@@ -897,6 +901,9 @@ func postAdminBanned(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
+	go func() {
+		fmt.Println(http.ListenAndServe("localhost:6060", nil))
+	}()
 	host := os.Getenv("ISUCONP_DB_HOST")
 	if host == "" {
 		host = "localhost"
